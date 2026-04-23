@@ -95,10 +95,19 @@ def train_model(df):
 
 def score_leads(df, model, le_ind, le_stage):
     df = df.copy()
+    
+    # --- SAFETY FIX: Handle Missing Values ---
+    df['budget_k'] = pd.to_numeric(df['budget_k'], errors='coerce').fillna(0)
+    df['employees'] = pd.to_numeric(df['employees'], errors='coerce').fillna(1)
+    df['engagement_score'] = pd.to_numeric(df['engagement_score'], errors='coerce').fillna(0)
+    df['industry'] = df['industry'].fillna('SaaS')
+    df['deal_stage'] = df['deal_stage'].fillna('Discovery')
+
     df["industry_s"]   = df["industry"].apply(
         lambda x: x if x in le_ind.classes_   else le_ind.classes_[0])
     df["deal_stage_s"] = df["deal_stage"].apply(
         lambda x: x if x in le_stage.classes_ else le_stage.classes_[0])
+    
     X = pd.DataFrame({
         "budget_k":         df["budget_k"],
         "employees":        df["employees"],
@@ -106,10 +115,11 @@ def score_leads(df, model, le_ind, le_stage):
         "industry_enc":     le_ind.transform(df["industry_s"]),
         "deal_stage_enc":   le_stage.transform(df["deal_stage_s"]),
     })
+    
     probs = model.predict_proba(X)[:, 1]
     df["conversion_prob"] = (probs * 100).round(1)
     df["priority"] = pd.cut(df["conversion_prob"],
-                            bins=[0,40,65,100], labels=["Low","Medium","High"])
+                            bins=[-1,40,65,101], labels=["Low","Medium","High"])
     df["strategy"] = df.apply(_strategy, axis=1)
     return df.drop(columns=["industry_s","deal_stage_s"], errors="ignore")
 
@@ -134,15 +144,13 @@ if "chat_history"        not in st.session_state: st.session_state.chat_history 
 with st.sidebar:
     st.title("⚙️ Settings & Filters")
 
-    # Trello credentials
-    with st.expander("🔑 Trello connection",
-                     expanded=not st.session_state.trello_connected):
-        st.markdown(
-            "1. Get your **API Key** at [trello.com/power-ups/admin](https://trello.com/power-ups/admin)\n"
-            "2. Click *'Token'* on that page to generate your **Token**"
-        )
-        trello_key   = st.text_input("API Key",   type="password")
-        trello_token = st.text_input("API Token", type="password")
+    # Pull keys from Streamlit Secrets automatically
+    auto_key = st.secrets.get("TRELLO_API_KEY", "")
+    auto_token = st.secrets.get("TRELLO_TOKEN", "")
+
+    with st.expander("🔑 Trello connection", expanded=not st.session_state.trello_connected):
+        trello_key   = st.text_input("API Key",   value=auto_key, type="password")
+        trello_token = st.text_input("API Token", value=auto_token, type="password")
 
         if st.button("Connect to Trello"):
             try:
@@ -151,7 +159,7 @@ with st.sidebar:
                 st.session_state.trello_key   = trello_key
                 st.session_state.trello_token = trello_token
                 st.session_state.boards       = boards
-                st.success(f"✅ Connected! {len(boards)} board(s) found.")
+                st.success(f"✅ Connected!")
             except Exception as e:
                 st.error(f"❌ Failed: {e}")
 
@@ -162,17 +170,15 @@ with st.sidebar:
         board_id = next(b["id"] for b in boards if b["name"]==chosen_board)
 
         try:
-            lists = get_lists(board_id, st.session_state.trello_key,
-                              st.session_state.trello_token)
-            chosen_list = st.selectbox("List (cards go here)", [l["name"] for l in lists])
-            st.session_state.selected_list_id   = next(l["id"]   for l in lists if l["name"]==chosen_list)
+            lists = get_lists(board_id, st.session_state.trello_key, st.session_state.trello_token)
+            chosen_list = st.selectbox("List", [l["name"] for l in lists])
+            st.session_state.selected_list_id   = next(l["id"] for l in lists if l["name"]==chosen_list)
             st.session_state.selected_list_name = chosen_list
-        except Exception as e:
-            st.error(f"Could not fetch lists: {e}")
+        except:
+            pass
 
     st.divider()
 
-    # Lead filters
     uploaded = st.file_uploader("Upload lead CSV", type=["csv"])
     if uploaded:
         raw = pd.read_csv(uploaded)
@@ -181,192 +187,49 @@ with st.sidebar:
         if missing:
             st.error(f"Missing columns: {missing}")
         else:
-            st.session_state.df_scored = score_leads(
-                raw, st.session_state.model,
-                st.session_state.le_ind, st.session_state.le_stage)
-            st.success(f"✅ {len(raw)} leads loaded")
+            st.session_state.df_scored = score_leads(raw, st.session_state.model, st.session_state.le_ind, st.session_state.le_stage)
 
     df_all = st.session_state.df_scored
-    industries   = st.multiselect("Industry",
-                                  sorted(df_all["industry"].unique()),
-                                  default=sorted(df_all["industry"].unique()))
-    bmin,bmax    = int(df_all["budget_k"].min()), int(df_all["budget_k"].max())
-    budget_range = st.slider("Budget ($k)", bmin, bmax, (bmin, bmax))
-    prob_min     = st.slider("Min conv. prob (%)", 0, 100, 0, step=5)
-    priorities   = st.multiselect("Priority", ["High","Medium","Low"],
-                                  default=["High","Medium","Low"])
+    industries   = st.multiselect("Industry", sorted(df_all["industry"].unique()), default=sorted(df_all["industry"].unique()))
+    budget_range = st.slider("Budget ($k)", int(df_all["budget_k"].min()), int(df_all["budget_k"].max()), (0, 1000))
+    priorities   = st.multiselect("Priority", ["High","Medium","Low"], default=["High","Medium","Low"])
 
-# ── Apply filters ─────────────────────────────────────────────────────────────
+# ── Main UI Logic ─────────────────────────────────────────────────────────────
 df = df_all[
     df_all["industry"].isin(industries) &
     df_all["budget_k"].between(*budget_range) &
-    (df_all["conversion_prob"] >= prob_min) &
     df_all["priority"].isin(priorities)
 ].reset_index(drop=True)
 
-# ── Page header & KPIs ────────────────────────────────────────────────────────
-st.title("📊 Lead Scoring & Pipeline Manager")
-st.caption(f"Showing **{len(df)}** of **{len(df_all)}** leads")
+st.title("📊 Lead Scoring Manager")
+k1,k2,k3 = st.columns(3)
+k1.metric("🔥 High-priority", int((df["priority"]=="High").sum()))
+k2.metric("🎯 Avg Prob", f"{df['conversion_prob'].mean():.1f}%" if len(df) else "0%")
+k3.metric("💰 Total Pipeline", f"${df['budget_k'].sum():,}k")
 
-k1,k2,k3,k4 = st.columns(4)
-k1.metric("🔥 High-priority leads", int((df["priority"]=="High").sum()))
-k2.metric("🎯 Avg conv. prob",
-          f"{df['conversion_prob'].mean():.1f}%" if len(df) else "—")
-k3.metric("💰 Total pipeline",   f"${df['budget_k'].sum():,}k")
-k4.metric("📦 Avg deal size",
-          f"${df['budget_k'].mean():,.0f}k" if len(df) else "—")
+col_left, col_right = st.columns([2, 1], gap="medium")
 
-st.divider()
-
-# ── TWO-COLUMN LAYOUT ─────────────────────────────────────────────────────────
-col_left, col_right = st.columns([2.2, 1], gap="large")
-
-# ═══════════════ LEFT: Pipeline table ════════════════════════════════════════
 with col_left:
     st.subheader("Lead pipeline")
-
     def color_prob(val):
         if val >= 70: return "color:#3B6D11;font-weight:600"
-        if val >= 45: return "color:#BA7517;font-weight:600"
         return "color:#A32D2D;font-weight:600"
 
-    cols    = ["company","industry","budget_k","engagement_score",
-               "deal_stage","conversion_prob","priority","strategy"]
-    renames = {"company":"Company","industry":"Industry","budget_k":"Budget ($k)",
-               "engagement_score":"Engagement","deal_stage":"Stage",
-               "conversion_prob":"Conv. Prob (%)","priority":"Priority",
-               "strategy":"Strategy"}
-    styled = (df[cols].rename(columns=renames)
-              .style
-              .map(color_prob, subset=["Conv. Prob (%)"])
-              .format({"Conv. Prob (%)":"{:.1f}","Budget ($k)":"{:,}"}))
-    st.dataframe(styled, use_container_width=True, height=300)
+    cols = ["company","industry","budget_k","conversion_prob","priority","strategy"]
+    styled = (df[cols].style.map(color_prob, subset=["conversion_prob"])
+              .format({"conversion_prob":"{:.1f}%","budget_k":"${:,}k"}))
+    st.dataframe(styled, width="stretch", height=400) # FIXED: width="stretch" for 2026
 
-    # Push any lead as a Trello card
-    st.subheader("📤 Push lead → Trello")
-    if not st.session_state.trello_connected:
-        st.info("Connect Trello in the sidebar first.")
-    elif len(df) == 0:
-        st.info("No leads match current filters.")
-    else:
-        lead_pick = st.selectbox("Choose lead", df["company"], key="lead_pick")
-        row = df[df["company"]==lead_pick].iloc[0]
-        btn_label = (f"Send to Trello list: "
-                     f"**{st.session_state.selected_list_name}**")
-        if st.button(btn_label):
-            try:
-                name = f"[{row['priority']}] {row['company']} — {row['conversion_prob']}% conv."
-                desc = (
-                    f"Industry: {row['industry']}\n"
-                    f"Budget: ${row['budget_k']}k\n"
-                    f"Engagement: {row['engagement_score']}\n"
-                    f"Stage: {row['deal_stage']}\n"
-                    f"Conversion probability: {row['conversion_prob']}%\n"
-                    f"Strategy: {row['strategy']}"
-                )
-                card = create_card(st.session_state.selected_list_id,
-                                   name, desc,
-                                   st.session_state.trello_key,
-                                   st.session_state.trello_token)
-                st.success(f"✅ Card created! [Open in Trello ↗]({card['url']})")
-                st.session_state.pop("trello_cards_cache", None)   # refresh
-            except Exception as e:
-                st.error(f"Failed: {e}")
-
-    # Probability chart
-    st.subheader("Conversion probability by lead")
-    if len(df):
-        fig = px.bar(
-            df.sort_values("conversion_prob", ascending=False),
-            x="company", y="conversion_prob", color="priority",
-            color_discrete_map={"High":"#639922","Medium":"#BA7517","Low":"#E24B4A"},
-            labels={"company":"","conversion_prob":"Conv. Prob (%)","priority":"Priority"},
-            height=240,
-        )
-        fig.update_layout(margin=dict(l=0,r=0,t=10,b=0), xaxis_tickangle=-30,
-                          legend=dict(orientation="h",yanchor="bottom",y=1.02))
-        fig.add_hline(y=65, line_dash="dot", line_color="#185FA5",
-                      annotation_text="High threshold")
-        fig.add_hline(y=40, line_dash="dot", line_color="#BA7517",
-                      annotation_text="Medium threshold")
-        st.plotly_chart(fig, use_container_width=True)
-
-# ═══════════════ RIGHT: Trello chat panel ════════════════════════════════════
 with col_right:
-    st.subheader("💬 Trello notes")
-
-    if not st.session_state.trello_connected:
-        st.info("🔑 Connect Trello in the sidebar to use this panel.")
+    st.subheader("📤 Push to Trello")
+    if st.session_state.trello_connected and len(df) > 0:
+        lead_pick = st.selectbox("Choose lead", df["company"])
+        row = df[df["company"]==lead_pick].iloc[0]
+        if st.button("Send to Trello"):
+            try:
+                create_card(st.session_state.selected_list_id, f"{row['company']} - {row['priority']}", row['strategy'], st.session_state.trello_key, st.session_state.trello_token)
+                st.success("Card Created!")
+            except Exception as e:
+                st.error(f"Error: {e}")
     else:
-        st.caption(
-            f"Messages go to **{st.session_state.selected_list_name}** as Trello cards. "
-            "Cards from that list appear below."
-        )
-
-        # ── Cards from Trello ─────────────────────────────────────────────────
-        c1, c2 = st.columns([3,1])
-        c1.markdown("**Cards in Trello**")
-        if c2.button("🔄 Refresh"):
-            st.session_state.pop("trello_cards_cache", None)
-
-        if "trello_cards_cache" not in st.session_state:
-            try:
-                cards = get_cards(st.session_state.selected_list_id,
-                                  st.session_state.trello_key,
-                                  st.session_state.trello_token)
-                st.session_state.trello_cards_cache = cards
-            except Exception as e:
-                st.error(f"Could not load cards: {e}")
-                st.session_state.trello_cards_cache = []
-
-        cards = st.session_state.get("trello_cards_cache", [])
-        if not cards:
-            st.write("No cards yet in this list.")
-        else:
-            for c in cards[-8:][::-1]:   # newest first, max 8
-                preview = c.get("desc","")[:100]
-                if len(c.get("desc","")) > 100: preview += "…"
-                st.markdown(f"""
-<div class="trello-card">
-  <h4>🗂 {c['name']}</h4>
-  <p>{preview}</p>
-  <p><a href="{c.get('url','#')}" target="_blank" style="font-size:11px">Open in Trello ↗</a></p>
-</div>""", unsafe_allow_html=True)
-
-        st.divider()
-
-        # ── Chat history (this session) ───────────────────────────────────────
-        st.markdown("**This session**")
-        chat_box = st.container(height=200)
-        with chat_box:
-            if not st.session_state.chat_history:
-                st.caption("Type a message below — it will appear here and in Trello.")
-            for msg in st.session_state.chat_history:
-                icon = "🧑" if msg["role"]=="user" else "🟦 Trello"
-                st.markdown(f"**{icon}:** {msg['text']}")
-
-        # ── Input form ────────────────────────────────────────────────────────
-        with st.form("chat_form", clear_on_submit=True):
-            user_msg   = st.text_area("Write a note", height=80,
-                                      placeholder="e.g. Follow up with NovaTech by Friday…")
-            card_title = st.text_input("Card title (optional)",
-                                       placeholder="e.g. NovaTech follow-up task")
-            sent = st.form_submit_button("Send to Trello →")
-
-        if sent and user_msg.strip():
-            title = card_title.strip() or user_msg.strip()[:60]
-            try:
-                card = create_card(
-                    st.session_state.selected_list_id,
-                    title, user_msg.strip(),
-                    st.session_state.trello_key,
-                    st.session_state.trello_token,
-                )
-                st.session_state.chat_history.append(
-                    {"role":"user",   "text": user_msg.strip()})
-                st.session_state.chat_history.append(
-                    {"role":"trello", "text": f"Card saved → [{title}]({card['url']})"})
-                st.session_state.pop("trello_cards_cache", None)  # auto-refresh
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not send to Trello: {e}")
+        st.info("Check Trello connection or lead filters.")
